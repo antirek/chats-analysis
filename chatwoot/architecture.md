@@ -69,7 +69,18 @@
 
 ### ContactInbox
 - **Описание**: Связь между Contact и Inbox с уникальным идентификатором для канала (source_id)
-- **Назначение**: Один Contact может иметь разные идентификаторы в разных каналах (например, email в Email, phone_number в WhatsApp)
+- **Назначение**: Один Contact может иметь разные идентификаторы в разных каналах
+- **Идентификаторы по каналам**:
+  - **Email**: `email` адрес (например, `user@example.com`)
+  - **WhatsApp**: `phone_number` без символа `+` (например, `1234567890`)
+  - **Telegram**: `user_id` (числовой ID пользователя из Telegram API, например, `123456789`)
+  - **SMS/Twilio**: `phone_number` в формате E.164 (например, `+1234567890`)
+  - **Web Widget/API**: `UUID` (случайно сгенерированный)
+  - **Facebook/Instagram**: `page_scoped_id` (ID пользователя в контексте страницы)
+- **Важно**: В Telegram используется именно `user_id` (числовой ID), а не username или phone_number, так как:
+  - `user_id` всегда присутствует и уникален
+  - `username` может отсутствовать или изменяться
+  - `phone_number` обычно недоступен через Bot API
 - **Связи**: Принадлежит Contact и Inbox, имеет pubsub_token для WebSocket соединений
 
 ### User (Пользователь)
@@ -687,12 +698,75 @@ sequenceDiagram
 
 ### Мультиканальность
 
-Один Contact может иметь несколько ContactInbox записей:
-- Один для Email (source_id = email)
-- Один для WhatsApp (source_id = phone_number)
-- Один для Web Widget (source_id = identifier)
+Один Contact может иметь несколько ContactInbox записей, каждая с уникальным source_id для своего канала:
+- **Email**: `source_id = email` (например, `user@example.com`)
+- **WhatsApp**: `source_id = phone_number` без `+` (например, `1234567890`)
+- **Telegram**: `source_id = user_id` (числовой ID из Telegram API, например, `123456789`)
+- **SMS**: `source_id = phone_number` (например, `+1234567890`)
+- **Web Widget**: `source_id = UUID` (случайно сгенерированный при первом визите)
+- **API**: `source_id = UUID` (предоставляется клиентом или генерируется)
 
-Все разговоры связаны через Contact, что позволяет видеть полную историю взаимодействий.
+**Детали идентификации в Telegram:**
+
+В Telegram используется **числовой user_id** (не username и не phone_number) как `source_id` для ContactInbox. Это реализовано в `Telegram::IncomingMessageService`:
+
+```ruby
+# app/services/telegram/incoming_message_service.rb
+def set_contact
+  contact_inbox = ::ContactInboxWithContactBuilder.new(
+    source_id: telegram_params_from_id,  # <- используется user_id
+    inbox: inbox,
+    contact_attributes: contact_attributes
+  ).perform
+end
+
+# app/services/telegram/param_helpers.rb
+def telegram_params_from_id
+  return telegram_params_base_object[:chat][:id] if business_message?
+  telegram_params_base_object[:from][:id]  # <- это числовой user_id
+end
+```
+
+**Почему user_id, а не username или phone_number?**
+
+1. **user_id** (числовой ID):
+   - ✅ Всегда присутствует в каждом сообщении от пользователя
+   - ✅ Уникален и постоянен (не меняется)
+   - ✅ Используется для отправки сообщений через Telegram Bot API
+   - ✅ Это стандартный идентификатор в Telegram API
+
+2. **username** (@username):
+   - ❌ Может отсутствовать (пользователь может не иметь username)
+   - ❌ Может изменяться пользователем
+   - ❌ Не используется для отправки сообщений (нужен user_id)
+   - ✅ Сохраняется в `contact.additional_attributes.social_telegram_user_name` для отображения в UI
+
+3. **phone_number**:
+   - ❌ Обычно недоступен через Telegram Bot API (защита приватности)
+   - ❌ Доступен только если пользователь сам отправит контактную карточку
+   - ❌ Не используется для идентификации
+
+**Пример payload от Telegram:**
+```json
+{
+  "message": {
+    "from": {
+      "id": 123456789,           // <- используется как source_id
+      "is_bot": false,
+      "first_name": "John",
+      "last_name": "Doe",
+      "username": "johndoe",     // <- опционально, сохраняется в additional_attributes
+      "language_code": "en"
+    },
+    "chat": {
+      "id": 123456789,           // <- для приватных чатов равен from.id
+      "type": "private"
+    }
+  }
+}
+```
+
+Все разговоры связаны через Contact, что позволяет видеть полную историю взаимодействий клиента через все каналы.
 
 ---
 
