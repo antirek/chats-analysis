@@ -12,7 +12,38 @@
 2. **MessagesController** — контроллер для обработки HTTP-запросов (веб и API)
 3. **ChMessage** — модель Eloquent для сообщений
 4. **ChFavorite** — модель для избранных контактов
-5. **Pusher** — сервис для real-time коммуникации через WebSocket
+5. **Pusher** — внешний SaaS-сервис для real-time коммуникации через WebSocket
+
+### Pusher — что это?
+
+**Pusher** — это внешний облачный сервис (SaaS), предоставляющий инфраструктуру для real-time коммуникации через WebSocket. Это не компонент Laravel, а отдельный сервис, который требует:
+
+1. **Регистрации** на сайте [pusher.com](https://pusher.com)
+2. **Создания приложения** в панели управления Pusher
+3. **Получения учетных данных**:
+   - `PUSHER_APP_KEY` — публичный ключ приложения
+   - `PUSHER_APP_SECRET` — секретный ключ (используется на сервере)
+   - `PUSHER_APP_ID` — ID приложения
+   - `PUSHER_APP_CLUSTER` — регион кластера (например, `mt1`, `eu`, `ap-southeast-1`)
+
+4. **Настройки в `.env` файле**:
+   ```env
+   PUSHER_APP_KEY=your_key
+   PUSHER_APP_SECRET=your_secret
+   PUSHER_APP_ID=your_app_id
+   PUSHER_APP_CLUSTER=mt1
+   ```
+
+**Альтернативы Pusher:**
+- Можно использовать собственный WebSocket-сервер (например, Laravel Echo Server, Soketi)
+- Или другие сервисы: Ably, PubNub, Firebase Realtime Database
+
+**Почему Pusher?**
+- Простая интеграция
+- Масштабируемость
+- Надежность
+- Поддержка приватных и presence-каналов
+- Бесплатный тарифный план для разработки
 
 ### База данных
 
@@ -79,7 +110,7 @@ graph TB
     end
     
     subgraph "Внешние сервисы"
-        PusherServer[Pusher Server]
+        PusherServer[Pusher Server<br/>(SaaS - pusher.com)]
         Database[(База данных<br/>MySQL/PostgreSQL)]
     end
     
@@ -353,11 +384,28 @@ sequenceDiagram
 Основные настройки в `config/chatify.php`:
 
 - `pusher` — настройки Pusher (key, secret, app_id, cluster)
+  - **Важно**: Требуется регистрация на pusher.com и получение учетных данных
+  - Настройки берутся из переменных окружения `.env`
 - `attachments` — настройки вложений (размер, расширения, папка)
 - `user_avatar` — настройки аватаров
 - `colors` — доступные цвета для мессенджера
 - `sounds` — настройки звуков
 - `routes` — настройки маршрутов
+
+### Настройка Pusher
+
+Для работы Chatify необходимо настроить Pusher:
+
+1. Зарегистрируйтесь на [pusher.com](https://pusher.com)
+2. Создайте новое приложение
+3. Скопируйте учетные данные в `.env`:
+   ```env
+   PUSHER_APP_KEY=your_app_key
+   PUSHER_APP_SECRET=your_app_secret
+   PUSHER_APP_ID=your_app_id
+   PUSHER_APP_CLUSTER=mt1
+   ```
+4. Убедитесь, что в `config/broadcasting.php` настроен драйвер `pusher`
 
 ## Расширяемость
 
