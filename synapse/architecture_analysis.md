@@ -578,19 +578,249 @@ sequenceDiagram
     WORKER->>CLIENT: Новое событие
 ```
 
+## Механизм prev_events: Зачем нужны ссылки на предыдущие события
+
+### Проблема: Как обеспечить порядок и консистентность в распределенной системе?
+
+В Matrix события могут приходить с разных серверов, в разное время, и даже в неправильном порядке. Как гарантировать, что все серверы видят события в одинаковом порядке? Как разрешить конфликты, когда два пользователя одновременно отправляют сообщения?
+
+**Ответ: Directed Acyclic Graph (DAG) через `prev_events`**
+
+### Что такое prev_events?
+
+`prev_events` — это массив `event_id` предыдущих событий, на которые ссылается новое событие. Это создает направленный граф (DAG), где каждое событие "знает" о своих предшественниках.
+
+```mermaid
+graph LR
+    A[Event A<br/>depth: 1] --> B[Event B<br/>depth: 2]
+    B --> C[Event C<br/>depth: 3]
+    C --> D[Event D<br/>depth: 4]
+    
+    style A fill:#e1f5ff
+    style D fill:#fff4e1
+```
+
+### Зачем это нужно?
+
+#### 1. **Обеспечение порядка событий**
+
+Без `prev_events` невозможно определить правильный порядок событий в распределенной системе. С `prev_events` каждое событие явно указывает, после каких событий оно должно идти.
+
+**Пример:**
+```
+Пользователь A отправляет сообщение "Привет" → Event1
+Пользователь B отправляет сообщение "Пока" → Event2
+```
+
+Если Event2 ссылается на Event1 в `prev_events`, то все серверы знают, что "Привет" должно идти перед "Пока", даже если Event2 пришел раньше Event1.
+
+#### 2. **Разрешение конфликтов при одновременной отправке**
+
+Когда два пользователя отправляют сообщения одновременно, возникает "fork" (вилка) в графе:
+
+```mermaid
+graph LR
+    A[Event A] --> B[Event B<br/>User1: Привет]
+    A --> C[Event C<br/>User2: Пока]
+    B --> D[Event D<br/>User3: Как дела?]
+    C --> D
+    
+    style B fill:#ffe1f5
+    style C fill:#ffe1f5
+    style D fill:#e1ffe1
+```
+
+Event D ссылается на **оба** события (B и C) в `prev_events`, тем самым "сшивая" вилку и создавая единую историю.
+
+#### 3. **Определение состояния комнаты**
+
+Состояние комнаты вычисляется на основе последних state-событий в графе. `prev_events` позволяют определить, какое состояние было актуально на момент создания события.
+
+#### 4. **Проверка консистентности**
+
+Если событие ссылается на `prev_event`, которого нет в базе данных, это означает проблему — либо событие пришло раньше своих предшественников, либо есть пробел в истории. В этом случае сервер запрашивает недостающие события (backfill).
+
+### Forward Extremities — что это?
+
+**Forward Extremity** (передняя крайняя точка) — это событие, которое еще **не имеет следующих событий**. Это самые "свежие" события в комнате, которые еще не были использованы как `prev_events` для других событий.
+
+**Пример:**
+```
+Комната имеет события: A → B → C → D
+                              ↓
+                             E
+```
+
+Здесь D и E — это forward extremities. Когда создается новое событие F, оно должно ссылаться на D и E в `prev_events`.
+
+### Как это работает на практике?
+
+#### Шаг 1: Получение forward extremities
+
+Когда пользователь отправляет сообщение, Synapse запрашивает forward extremities комнаты:
+
+```python
+# synapse/storage/databases/main/event_federation.py
+async def get_prev_events_for_room(self, room_id: str) -> List[str]:
+    """
+    Gets a subset of the current forward extremities in the given room.
+    Limits the result to 10 extremities.
+    """
+    # Запрос к БД: SELECT event_id FROM event_forward_extremities
+    # WHERE room_id = ? ORDER BY depth DESC LIMIT 10
+```
+
+**Ограничение до 10:** Если в комнате много одновременных сообщений, может быть много forward extremities. Чтобы не создавать события с сотнями `prev_events`, берется максимум 10 самых "глубоких" (с наибольшим depth).
+
+#### Шаг 2: Создание события с prev_events
+
+```python
+# synapse/handlers/message.py
+async def create_new_client_event(self, builder, ...):
+    # Получаем forward extremities
+    prev_event_ids = await self.store.get_prev_events_for_room(builder.room_id)
+    
+    # Создаем событие, ссылающееся на них
+    event = await builder.build(
+        prev_event_ids=prev_event_ids,  # ← вот они!
+        auth_event_ids=auth_ids,
+        depth=max(prev_events.depth) + 1  # depth = максимальная глубина prev + 1
+    )
+```
+
+#### Шаг 3: Вычисление depth
+
+`depth` — это число, показывающее "глубину" события в графе. Оно вычисляется как максимальный depth среди `prev_events` + 1.
+
+```mermaid
+graph TD
+    A[depth: 1] --> B[depth: 2]
+    B --> C[depth: 3]
+    A --> D[depth: 2]
+    C --> E[depth: 4]
+    D --> E
+    
+    style E fill:#fff4e1
+```
+
+Event E имеет `prev_events = [C, D]`. Depth(E) = max(depth(C), depth(D)) + 1 = max(3, 2) + 1 = 4.
+
+#### Шаг 4: Обновление forward extremities
+
+После сохранения нового события, forward extremities обновляются:
+
+```python
+# synapse/storage/controllers/persist_events.py
+async def _calculate_new_extremities(self, room_id, events, latest_event_ids):
+    # Начинаем с существующих forward extremities
+    result = set(latest_event_ids)
+    
+    # Добавляем новые события
+    result.update(event.event_id for event in new_events)
+    
+    # Удаляем события, которые теперь являются prev_events новых событий
+    result.difference_update(
+        e_id for event in new_events for e_id in event.prev_event_ids()
+    )
+    
+    return result
+```
+
+**Логика:** Если событие X было forward extremity, но теперь новое событие Y ссылается на X в `prev_events`, то X больше не является forward extremity. Y становится новой forward extremity.
+
+### Визуальный пример полного цикла
+
+```mermaid
+sequenceDiagram
+    participant USER as Пользователь
+    participant HS as Homeserver
+    participant DB as База данных
+    
+    Note over USER,DB: Начальное состояние: Event A (forward extremity)
+    
+    USER->>HS: Отправка сообщения
+    HS->>DB: Запрос forward extremities
+    DB-->>HS: [Event A]
+    
+    HS->>HS: Создание Event B<br/>prev_events: [A]<br/>depth: depth(A) + 1 = 2
+    
+    HS->>DB: Сохранение Event B
+    DB->>DB: Обновление forward extremities:<br/>Удалить A (теперь prev_event)<br/>Добавить B (новая extremity)
+    
+    Note over USER,DB: Новое состояние: Event B (forward extremity)
+    
+    USER->>HS: Отправка еще одного сообщения
+    HS->>DB: Запрос forward extremities
+    DB-->>HS: [Event B]
+    
+    HS->>HS: Создание Event C<br/>prev_events: [B]<br/>depth: depth(B) + 1 = 3
+    
+    HS->>DB: Сохранение Event C
+    DB->>DB: Обновление: B → C
+```
+
+### Случай с конфликтом (одновременная отправка)
+
+```mermaid
+graph TD
+    A[Event A<br/>depth: 1] --> B[Event B<br/>User1: Привет<br/>depth: 2]
+    A --> C[Event C<br/>User2: Пока<br/>depth: 2]
+    
+    B -.->|prev_events: [A]| B
+    C -.->|prev_events: [A]| C
+    
+    B --> D[Event D<br/>User3: Как дела?<br/>depth: 3]
+    C --> D
+    
+    D -.->|prev_events: [B, C]| D
+    
+    style B fill:#ffe1f5
+    style C fill:#ffe1f5
+    style D fill:#e1ffe1
+```
+
+**Что произошло:**
+1. User1 и User2 одновременно отправили сообщения
+2. Оба события (B и C) ссылаются на A в `prev_events`
+3. Оба имеют одинаковый depth = 2
+4. Когда User3 отправляет сообщение, Event D ссылается на **оба** события (B и C)
+5. Это "сшивает" вилку и создает единую историю
+
+### Почему это важно для федерации?
+
+В федеративной системе события могут приходить с разных серверов в разном порядке:
+
+```
+Сервер 1 получает: Event A, затем Event B
+Сервер 2 получает: Event B, затем Event A
+```
+
+Без `prev_events` серверы могли бы показать события в разном порядке. С `prev_events`:
+- Event B явно указывает, что A идет перед ним
+- Сервер 2, получив B раньше A, знает, что нужно подождать A или запросить его (backfill)
+- Оба сервера в итоге покажут события в одинаковом порядке
+
+### Резюме
+
+**`prev_events` — это механизм, который:**
+
+1. ✅ **Обеспечивает порядок** — каждое событие явно указывает свои предшественники
+2. ✅ **Разрешает конфликты** — одновременные события "сшиваются" через общие `prev_events`
+3. ✅ **Определяет состояние** — позволяет вычислить состояние комнаты на момент события
+4. ✅ **Обеспечивает консистентность** — помогает обнаружить пробелы в истории
+5. ✅ **Работает в распределенной системе** — все серверы приходят к одинаковому порядку событий
+
+**Forward Extremities** — это "кончики" графа, самые свежие события, которые используются как `prev_events` для следующих событий.
+
 ## Оптимизации и особенности
 
 ### State Groups
 
 Вместо хранения полного состояния для каждого события, Synapse использует state groups — группы событий с одинаковым состоянием. Это значительно уменьшает объем хранимых данных.
 
-### Forward Extremities
-
-Forward extremities — это события, которые еще не имеют следующих событий. При создании нового события используются forward extremities как prev_events.
-
 ### Backfill
 
-Если сервер получает событие, ссылающееся на неизвестное prev_event, он запрашивает недостающие события у других серверов (backfill).
+Если сервер получает событие, ссылающееся на неизвестное prev_event, он запрашивает недостающие события у других серверов (backfill). Это гарантирует, что граф событий остается связным.
 
 ### Event DAG
 
