@@ -326,12 +326,12 @@ graph LR
     GLOBAL_ENV --> LOAD_CODE[Загрузка кода модуля]
     HOST_ENV --> LOAD_CODE
     
-    LOAD_CODE --> CALL_LOAD[Вызов module:load()]
+    LOAD_CODE --> CALL_LOAD[Вызов module.load]
     CALL_LOAD --> HOOK_EVENTS[Регистрация обработчиков событий]
     HOOK_EVENTS --> READY[Модуль готов]
     
-    READY --> CALL_READY{Есть<br/>module:ready()?}
-    CALL_READY -->|Да| READY_HOOK[Вызов module:ready()]
+    READY --> CALL_READY{Есть<br/>module.ready?}
+    CALL_READY -->|Да| READY_HOOK[Вызов module.ready]
     CALL_READY -->|Нет| DONE[Готово]
     READY_HOOK --> DONE
 ```

@@ -24,22 +24,22 @@ sequenceDiagram
     
     Note over A: Пользователь отправляет<br/>сообщение
     
-    A->>C2S: TCP/XMPP: message stanza<br/>&lt;message to="bob@example.com"&gt;
+    A->>C2S: message stanza to bob@example.com
     
-    Note over C2S: Получение stanza<br/>из XMPP потока
+    Note over C2S: Получение stanza из XMPP потока
     
-    C2S->>SR: core_process_stanza(origin, stanza)
+    C2S->>SR: core_process_stanza
     
-    Note over SR: 1. Валидация stanza<br/>2. Добавление 'from' атрибута<br/>3. Нормализация JID
+    Note over SR: Валидация, добавление from, нормализация JID
     
-    SR->>SR: stanza.attr.from = "alice@example.com/phone"
-    SR->>SR: jid_prepped_split("bob@example.com")
+    SR->>SR: stanza.attr.from = alice@example.com/phone
+    SR->>SR: jid_prepped_split bob@example.com
     
-    SR->>SR: core_post_stanza(origin, stanza, true)
+    SR->>SR: core_post_stanza
     
-    Note over SR: Определение типа адресата:<br/>node="bob", host="example.com"<br/>resource отсутствует → /bare
+    Note over SR: Определение типа адресата: /bare
     
-    SR->>MSG: fire_event("message/bare", {<br/>  origin=origin,<br/>  stanza=stanza,<br/>  to_self=false<br/>})
+    SR->>MSG: fire_event message/bare
     
     MSG->>MSG: process_to_bare("bob@example.com", origin, stanza)
     
@@ -163,13 +163,13 @@ sequenceDiagram
     participant S2 as Server 2<br/>(Remote XMPP)
     participant B as Bob Client
     
-    A->>S1: message stanza<br/>(to: bob@server2.com)
+    A->>S1: message stanza to bob@server2.com
     
-    S1->>S1: core_process_stanza()
-    S1->>S1: core_post_stanza()
-    S1->>S1: Определение: удаленный хост
+    S1->>S1: core_process_stanza
+    S1->>S1: core_post_stanza
+    S1->>S1: Определение удаленного хоста
     
-    S1->>S1: core_route_stanza()
+    S1->>S1: core_route_stanza
     
     alt S2S соединение существует
         S1->>S2: Отправка через существующее s2s
@@ -186,9 +186,9 @@ sequenceDiagram
         S1->>S2: Отправка сообщения
     end
     
-    S2->>S2: core_process_stanza()
+    S2->>S2: core_process_stanza
     S2->>S2: Проверка авторизации from_host
-    S2->>S2: core_post_stanza()
+    S2->>S2: core_post_stanza
     S2->>B: Доставка сообщения
     B->>S2: Подтверждение
 ```
@@ -261,21 +261,21 @@ sequenceDiagram
     participant SM as Session Manager
     participant B as Bob Client<br/>(laptop)
     
-    A->>SR: message stanza<br/>(to: bob@example.com/laptop)
+    A->>SR: message stanza to bob@example.com/laptop
     
-    SR->>SR: core_process_stanza()
-    SR->>SR: Определение типа: /full
+    SR->>SR: core_process_stanza
+    SR->>SR: Определение типа /full
     
-    SR->>MSG: fire_event("message/full")
+    SR->>MSG: fire_event message/full
     
-    MSG->>SM: Проверка: full_sessions["bob@example.com/laptop"]
+    MSG->>SM: Проверка full_sessions
     
     alt Ресурс онлайн
         SM->>B: Прямая доставка на ресурс
         B->>A: Подтверждение
     else Ресурс офлайн
-        MSG->>MSG: process_to_bare("bob@example.com")
-        Note over MSG: Обработка как bare JID:<br/>доставка на другие ресурсы<br/>или сохранение офлайн
+        MSG->>MSG: process_to_bare
+        Note over MSG: Обработка как bare JID, доставка на другие ресурсы или сохранение офлайн
     end
 ```
 
