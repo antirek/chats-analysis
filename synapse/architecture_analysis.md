@@ -832,6 +832,536 @@ Auth events — это события, необходимые для прове�
 - `m.room.power_levels` — права доступа
 - И другие state events, влияющие на авторизацию
 
+## Read Receipts и Read Markers: Механизм "прочитано/не прочитано"
+
+### Введение
+
+В Matrix есть два механизма для отслеживания прочтения сообщений:
+
+1. **Read Receipts (m.read)** — публичные уведомления о том, что пользователь прочитал конкретное сообщение. Видны всем участникам комнаты.
+2. **Read Markers (m.fully_read)** — приватные маркеры, показывающие, до какого события пользователь прочитал комнату. Видны только самому пользователю.
+
+Также существует **m.read.private** — приватный read receipt, видимый только самому пользователю.
+
+### Типы Receipts
+
+```python
+# synapse/api/constants.py
+class ReceiptTypes:
+    READ: Final = "m.read"              # Публичный read receipt
+    READ_PRIVATE: Final = "m.read.private"  # Приватный read receipt
+    FULLY_READ: Final = "m.fully_read"  # Read marker (всегда приватный)
+```
+
+**Разница между типами:**
+
+| Тип | Видимость | Назначение | Хранение |
+|-----|-----------|------------|----------|
+| `m.read` | Публичный | Показывает, что пользователь прочитал конкретное сообщение | `receipts_linearized` |
+| `m.read.private` | Приватный | То же, что `m.read`, но только для пользователя | `receipts_linearized` |
+| `m.fully_read` | Приватный | Маркер "прочитано до этого события" | `account_data` |
+
+### Архитектура Read Receipts
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        C1[Client A<br/>Отправитель]
+        C2[Client B<br/>Получатель]
+    end
+    
+    subgraph "REST API"
+        API1[POST /receipts<br/>m.read]
+        API2[POST /read_markers<br/>m.fully_read]
+    end
+    
+    subgraph "Handlers"
+        RH[ReceiptsHandler]
+        RMH[ReadMarkerHandler]
+    end
+    
+    subgraph "Storage"
+        DB1[(receipts_linearized<br/>receipts_graph)]
+        DB2[(account_data)]
+        STREAM[Receipts Stream]
+    end
+    
+    subgraph "Federation"
+        FS[FederationSender]
+        EDU[EDU: m.receipt]
+    end
+    
+    subgraph "Notification"
+        NOT[Notifier]
+        SYNC[/sync endpoint]
+    end
+    
+    C2 -->|Отметить прочитанным| API1
+    C2 -->|Установить маркер| API2
+    
+    API1 --> RH
+    API2 --> RMH
+    
+    RH --> DB1
+    RH --> STREAM
+    RMH --> DB2
+    
+    RH --> FS
+    FS --> EDU
+    
+    STREAM --> NOT
+    NOT --> SYNC
+    SYNC --> C1
+    
+    EDU -.->|Federation| OTHER_HS[Other Homeservers]
+    
+    style C1 fill:#ffe1f5
+    style C2 fill:#e1f5ff
+    style DB1 fill:#e1ffe1
+    style STREAM fill:#fff4e1
+```
+
+### Поток данных: Отправка Read Receipt
+
+```mermaid
+sequenceDiagram
+    participant CB as Client B<br/>(Получатель)
+    participant API as REST API
+    participant RH as ReceiptsHandler
+    participant DB as Database
+    participant STREAM as Receipts Stream
+    participant NOT as Notifier
+    participant FS as FederationSender
+    participant HS2 as Homeserver 2
+    participant CA as Client A<br/>(Отправитель)
+    
+    Note over CB,CA: Пользователь B прочитал сообщение от A
+    
+    CB->>API: POST /rooms/{room_id}/receipt/m.read/{event_id}
+    activate API
+    
+    API->>API: Проверка авторизации
+    API->>API: Валидация event_id
+    API->>RH: received_client_receipt()
+    activate RH
+    
+    RH->>RH: Проверка существования события
+    RH->>RH: Создание ReadReceipt объекта
+    
+    Note over RH: ReadReceipt:<br/>room_id, receipt_type,<br/>user_id, event_ids,<br/>data: {ts: timestamp}
+    
+    RH->>DB: insert_receipt()
+    activate DB
+    
+    Note over DB: Сохранение в receipts_linearized<br/>Получение stream_id
+    
+    DB-->>RH: stream_id
+    deactivate DB
+    
+    RH->>STREAM: Обновление receipts stream
+    RH->>NOT: on_new_event(RECEIPT, stream_id)
+    activate NOT
+    
+    Note over RH,FS: Если receipt_type != m.read.private
+    RH->>FS: send_read_receipt()
+    activate FS
+    
+    FS->>FS: Добавление в per-destination queue
+    FS->>FS: Создание EDU: m.receipt
+    FS->>HS2: POST /_matrix/federation/v1/send<br/>EDU: m.receipt
+    activate HS2
+    
+    HS2->>HS2: Обработка receipt EDU
+    HS2->>HS2: Сохранение receipt
+    HS2->>HS2: Уведомление локальных клиентов
+    
+    deactivate HS2
+    deactivate FS
+    
+    NOT->>CA: Пробуждение /sync запроса
+    CA->>API: GET /sync
+    API->>CA: {"receipts": {room_id: {event_id: {m.read: {userB: {ts: ...}}}}}}
+    
+    deactivate NOT
+    deactivate RH
+    API-->>CB: 200 OK
+    deactivate API
+```
+
+### Детальный процесс обработки Read Receipt
+
+#### Шаг 1: Клиент отправляет receipt
+
+```python
+# Клиент отправляет POST запрос
+POST /rooms/!room123/receipt/m.read/$event456
+Content-Type: application/json
+
+{
+  "thread_id": null  # или ID треда, если receipt для треда
+}
+```
+
+#### Шаг 2: Обработка в ReceiptsHandler
+
+```python
+# synapse/handlers/receipts.py
+async def received_client_receipt(
+    self, room_id, receipt_type, user_id, event_id, thread_id
+):
+    # Проверка существования события
+    if not await self.event_handler.get_event(user_id, room_id, event_id):
+        return
+    
+    # Создание ReadReceipt объекта
+    receipt = ReadReceipt(
+        room_id=room_id,
+        receipt_type=receipt_type,  # "m.read" или "m.read.private"
+        user_id=user_id.to_string(),
+        event_ids=[event_id],
+        thread_id=thread_id,
+        data={"ts": int(self.clock.time_msec())}  # timestamp
+    )
+    
+    # Сохранение и обработка
+    is_new = await self._handle_new_receipts([receipt])
+    
+    # Отправка через federation (если не приватный)
+    if self.federation_sender and receipt_type != ReceiptTypes.READ_PRIVATE:
+        await self.federation_sender.send_read_receipt(receipt)
+```
+
+#### Шаг 3: Сохранение в базу данных
+
+```python
+# synapse/storage/databases/main/receipts.py
+async def insert_receipt(
+    self, room_id, receipt_type, user_id, event_ids, thread_id, data
+):
+    # Конвертация event_ids в linearized форму (если несколько)
+    if len(event_ids) == 1:
+        linearized_event_id = event_ids[0]
+    else:
+        # Конвертация графа в линейную форму
+        linearized_event_id = await self._graph_to_linear(room_id, event_ids)
+    
+    # Получение нового stream_id
+    async with self._receipts_id_gen.get_next() as stream_id:
+        # Сохранение в receipts_linearized
+        await self.db_pool.runInteraction(
+            "insert_linearized_receipt",
+            self._insert_linearized_receipt_txn,
+            room_id, receipt_type, user_id,
+            linearized_event_id, thread_id, data,
+            stream_id=stream_id
+        )
+    
+    return stream_id
+```
+
+**Структура таблицы `receipts_linearized`:**
+
+```sql
+CREATE TABLE receipts_linearized (
+    stream_id BIGINT NOT NULL,
+    room_id TEXT NOT NULL,
+    receipt_type TEXT NOT NULL,  -- "m.read" или "m.read.private"
+    user_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    thread_id TEXT,  -- NULL для main timeline
+    data TEXT NOT NULL,  -- JSON: {"ts": timestamp}
+    CONSTRAINT receipts_linearized_uniqueness UNIQUE 
+        (room_id, receipt_type, user_id, thread_id)
+);
+```
+
+**Важно:** Для каждой комбинации `(room_id, receipt_type, user_id, thread_id)` может быть только один receipt. Новый receipt заменяет старый.
+
+#### Шаг 4: Уведомление через Receipts Stream
+
+```python
+# synapse/handlers/receipts.py
+async def _handle_new_receipts(self, receipts):
+    receipts_persisted = []
+    for receipt in receipts:
+        stream_id = await self.store.insert_receipt(...)
+        if stream_id is None:  # Старый receipt
+            continue
+        receipts_persisted.append(receipt)
+    
+    if not receipts_persisted:
+        return False
+    
+    max_batch_id = self.store.get_max_receipt_stream_id()
+    affected_room_ids = list({r.room_id for r in receipts_persisted})
+    
+    # Уведомление через receipts stream
+    self.notifier.on_new_event(
+        StreamKeyType.RECEIPT, max_batch_id, rooms=affected_room_ids
+    )
+    
+    # Уведомление pusher pool (для push-уведомлений)
+    await self.hs.get_pusherpool().on_new_receipts(
+        {r.user_id for r in receipts_persisted}
+    )
+    
+    return True
+```
+
+#### Шаг 5: Отправка через Federation
+
+```python
+# synapse/federation/sender/per_destination_queue.py
+def add_read_receipt_to_queue(self, receipt: ReadReceipt):
+    # Сериализация receipt
+    serialized_receipt = {
+        "event_ids": receipt.event_ids,
+        "data": receipt.data
+    }
+    if receipt.thread_id:
+        serialized_receipt["data"]["thread_id"] = receipt.thread_id
+    
+    # Поиск подходящего EDU или создание нового
+    for edu in self._pending_receipt_edus:
+        receipt_content = edu.setdefault(receipt.room_id, {}).setdefault(
+            receipt.receipt_type, {}
+        )
+        if receipt.user_id not in receipt_content:
+            receipt_content[receipt.user_id] = serialized_receipt
+            break
+    else:
+        # Создание нового EDU
+        self._pending_receipt_edus.append({
+            receipt.room_id: {
+                receipt.receipt_type: {
+                    receipt.user_id: serialized_receipt
+                }
+            }
+        })
+```
+
+**Формат EDU для federation:**
+
+```json
+{
+  "edu_type": "m.receipt",
+  "content": {
+    "!room123": {
+      "m.read": {
+        "@userB:server1.com": {
+          "event_ids": ["$event456"],
+          "data": {
+            "ts": 1234567890,
+            "thread_id": null
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### Read Markers (m.fully_read)
+
+Read Marker — это приватный маркер, показывающий, до какого события пользователь прочитал комнату. В отличие от read receipts, он хранится в `account_data`, а не в `receipts_linearized`.
+
+```mermaid
+sequenceDiagram
+    participant CB as Client B
+    participant API as REST API
+    participant RMH as ReadMarkerHandler
+    participant ADH as AccountDataHandler
+    participant DB as account_data table
+    participant SYNC as /sync
+    
+    CB->>API: POST /rooms/{room_id}/read_markers<br/>{"m.fully_read": "$event789"}
+    activate API
+    
+    API->>RMH: received_client_read_marker()
+    activate RMH
+    
+    RMH->>RMH: Получение текущего read marker
+    RMH->>RMH: Проверка: новый marker впереди?
+    
+    alt Новый marker впереди
+        RMH->>ADH: add_account_data_to_room()
+        activate ADH
+        
+        ADH->>DB: Сохранение в account_data<br/>type: m.fully_read<br/>content: {event_id: "$event789"}
+        
+        DB-->>ADH: OK
+        deactivate ADH
+        
+        ADH->>SYNC: Уведомление об изменении account_data
+    else Старый marker впереди
+        RMH->>RMH: Игнорирование (не обновляем назад)
+    end
+    
+    deactivate RMH
+    API-->>CB: 200 OK
+    deactivate API
+```
+
+**Ключевые отличия Read Markers:**
+
+1. **Хранение:** `account_data` вместо `receipts_linearized`
+2. **Видимость:** Только самому пользователю (приватный)
+3. **Назначение:** Показывает позицию "прочитано до", а не конкретное сообщение
+4. **Обновление:** Обновляется только если новый marker впереди текущего
+
+### Получение Receipts через /sync
+
+Когда клиент делает `/sync` запрос, он получает новые receipts:
+
+```python
+# synapse/handlers/sync.py
+async def _generate_sync_entry_for_rooms(...):
+    # Получение receipts
+    receipt_source = self.event_sources.sources.receipt
+    receipts, receipt_key = await receipt_source.get_new_events(
+        user=sync_config.user,
+        from_key=receipt_key,  # Последний известный receipt stream token
+        limit=sync_config.filter_collection.ephemeral_limit(),
+        room_ids=room_ids,
+    )
+    
+    # Фильтрация приватных receipts других пользователей
+    receipts = ReceiptEventSource.filter_out_private_receipts(
+        receipts, user.to_string()
+    )
+    
+    # Добавление в ответ
+    for event in receipts:
+        room_id = event["room_id"]
+        event_copy = {k: v for (k, v) in event.items() if k != "room_id"}
+        ephemeral_by_room.setdefault(room_id, []).append(event_copy)
+```
+
+**Формат ответа /sync:**
+
+```json
+{
+  "rooms": {
+    "join": {
+      "!room123": {
+        "ephemeral": {
+          "events": [
+            {
+              "type": "m.receipt",
+              "content": {
+                "$event456": {
+                  "m.read": {
+                    "@userB:server1.com": {
+                      "ts": 1234567890
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+### Визуализация полного потока
+
+```mermaid
+flowchart TD
+    START([Пользователь B прочитал<br/>сообщение от A]) --> SEND[POST /receipts<br/>m.read]
+    
+    SEND --> VALIDATE{Валидация<br/>event_id}
+    VALIDATE -->|Не существует| ERROR[400 Error]
+    VALIDATE -->|Существует| CREATE[Создание ReadReceipt]
+    
+    CREATE --> SAVE[Сохранение в БД<br/>receipts_linearized]
+    SAVE --> STREAM[Обновление<br/>Receipts Stream]
+    
+    STREAM --> CHECK{Тип receipt?}
+    CHECK -->|m.read.private| SKIP_FED[Пропустить federation]
+    CHECK -->|m.read| FED[Отправка через<br/>FederationSender]
+    
+    FED --> QUEUE[Добавление в<br/>per-destination queue]
+    QUEUE --> EDU[Создание EDU<br/>m.receipt]
+    EDU --> SEND_FED[HTTP POST на<br/>remote серверы]
+    
+    STREAM --> NOTIFY[Notifier:<br/>on_new_event]
+    SKIP_FED --> NOTIFY
+    
+    NOTIFY --> WAKE[Пробуждение<br/>/sync запросов]
+    WAKE --> SYNC[Клиент A получает<br/>receipt через /sync]
+    
+    SEND_FED --> REMOTE[Remote сервер<br/>обрабатывает receipt]
+    REMOTE --> REMOTE_NOTIFY[Уведомление<br/>локальных клиентов]
+    
+    style START fill:#e1f5ff
+    style SAVE fill:#e1ffe1
+    style STREAM fill:#fff4e1
+    style FED fill:#ffe1f5
+    style SYNC fill:#e1f5ff
+```
+
+### Хранение в базе данных
+
+#### Receipts (m.read, m.read.private)
+
+**Таблица `receipts_linearized`:**
+- `stream_id` — ID в receipts stream
+- `room_id` — ID комнаты
+- `receipt_type` — "m.read" или "m.read.private"
+- `user_id` — ID пользователя
+- `event_id` — ID события, которое прочитано
+- `thread_id` — ID треда (NULL для main timeline)
+- `data` — JSON с timestamp и другими данными
+
+**Уникальность:** `(room_id, receipt_type, user_id, thread_id)` — только один receipt на комбинацию.
+
+#### Read Markers (m.fully_read)
+
+**Таблица `account_data`:**
+- `user_id` — ID пользователя
+- `room_id` — ID комнаты (NULL для глобального account_data)
+- `account_data_type` — "m.fully_read"
+- `content` — JSON: `{"event_id": "$event789"}`
+
+### Поддержка Threads
+
+Matrix поддерживает threads (ветки обсуждений). Receipts могут быть привязаны к конкретному thread:
+
+```python
+# Отправка receipt для треда
+POST /rooms/!room123/receipt/m.read/$event456
+{
+  "thread_id": "$thread789"
+}
+```
+
+В этом случае receipt сохраняется с `thread_id = "$thread789"` и применяется только к событиям в этом треде.
+
+### Резюме
+
+**Read Receipts (m.read):**
+- ✅ Публичные уведомления о прочтении конкретного сообщения
+- ✅ Хранятся в `receipts_linearized`
+- ✅ Отправляются через federation (кроме `m.read.private`)
+- ✅ Видны всем участникам комнаты
+- ✅ Передаются через receipts stream в `/sync`
+
+**Read Markers (m.fully_read):**
+- ✅ Приватные маркеры позиции "прочитано до"
+- ✅ Хранятся в `account_data`
+- ✅ Видны только самому пользователю
+- ✅ Обновляются только вперед (не назад)
+- ✅ Передаются через account_data в `/sync`
+
+**Ключевые особенности:**
+1. Receipts заменяют предыдущие для той же комбинации `(room_id, receipt_type, user_id, thread_id)`
+2. Приватные receipts (`m.read.private`) не отправляются через federation
+3. Receipts stream позволяет клиентам получать обновления в реальном времени
+4. Federation использует EDU для передачи receipts между серверами
+
 ## Заключение
 
 Архитектура Synapse построена вокруг концепции событий (events), которые формируют неизменяемый граф (DAG) в каждой комнате. Процесс отправки сообщения включает:
@@ -843,3 +1373,5 @@ Auth events — это события, необходимые для прове�
 5. Отправку на другие homeservers через federation
 
 Все компоненты работают асинхронно, что позволяет Synapse обрабатывать большое количество одновременных запросов. Использование workers позволяет масштабировать систему горизонтально, распределяя нагрузку между процессами.
+
+Механизм read receipts обеспечивает обратную связь между пользователями, показывая, кто и когда прочитал сообщения, что критично для эффективной коммуникации в распределенной системе.
